@@ -46,10 +46,11 @@ def checkpoint(count):
     wr()
   return count
 
-def revnum_to_revref(rev, old_marks):
-  """Convert an hg revnum to a git-fast-import rev reference (an SHA1
+def nodehex_to_revref(nodehex, old_marks, mapping_cache):
+  """Convert an hg node in hex to a git-fast-import rev reference (an SHA1
   or a mark)"""
-  return old_marks.get(rev) or ':%d' % (rev+1)
+  mark=mapping_cache[nodehex];
+  return old_marks.get(mark) or ':%s' % mark
 
 def file_mismatch(f1,f2):
   """See if two revisions of a file are not equal."""
@@ -77,8 +78,7 @@ def get_filechanges(repo,revision,parents,mleft):
   """Given some repository and revision, find all changed/deleted files."""
   l,c,r=[],[],[]
   for p in parents:
-    if p<0: continue
-    mright=repo.changectx(p).manifest()
+    mright=p.manifest()
     l,c,r=split_dict(mleft,mright,l,c,r)
   l.sort()
   c.sort()
@@ -178,7 +178,7 @@ def strip_leading_slash(filename):
     return filename[1:]
   return filename
 
-def export_commit(ui,repo,revision,old_marks,max,count,authors,
+def export_commit(ui,repo,revision,old_marks,mapping_cache,max,count,authors,
                   branchesmap,sob,brmap,hgtags,encoding='',fn_encoding=''):
   def get_branchname(name):
     if brmap.has_key(name):
@@ -187,17 +187,17 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     brmap[name]=n
     return n
 
-  (revnode,_,user,(time,timezone),files,desc,branch,_)=get_changeset(ui,repo,revision,authors,encoding)
+  (changectx,_,user,(time,timezone),files,desc,branch,_)=get_changeset(ui,repo,revision,authors,encoding)
 
   branch=get_branchname(branch)
 
-  parents = [p for p in repo.changelog.parentrevs(revision) if p >= 0]
+  parents = [p for p in changectx.parents() if p.rev() >= 0]
 
   if len(parents)==0 and revision != 0:
     wr('reset refs/heads/%s' % branch)
 
   wr('commit refs/heads/%s' % branch)
-  wr('mark :%d' % (revision+1))
+  wr('mark :%s' % mapping_cache[changectx.hex()])
   if sob:
     wr('author %s %d %s' % (get_author(desc,user,authors),time,timezone))
   wr('committer %s %d %s' % (user,time,timezone))
@@ -215,16 +215,16 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     added.sort()
     type='full'
   else:
-    wr('from %s' % revnum_to_revref(parents[0], old_marks))
+    wr('from %s' % nodehex_to_revref(parents[0].hex(), old_marks, mapping_cache))
     if len(parents) == 1:
       # later non-merge revision: feed in changed manifest
       # if we have exactly one parent, just take the changes from the
       # manifest without expensively comparing checksums
-      f=repo.status(repo.lookup(parents[0]),revnode)[:3]
+      f=repo.status(parents[0].node(),changectx.node())[:3]
       added,changed,removed=f[1],f[0],f[2]
       type='simple delta'
     else: # a merge with two parents
-      wr('merge %s' % revnum_to_revref(parents[1], old_marks))
+      wr('merge %s' % nodehex_to_revref(parents[1].hex(), old_marks, mapping_cache))
       # later merge revision: feed in changed manifest
       # for many files comparing checksums is expensive so only do it for
       # merges where we really need it due to hg's revlog logic
@@ -246,18 +246,16 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
 
   return checkpoint(count)
 
-def export_note(ui,repo,revision,count,authors,encoding,is_first):
-  (revnode,_,user,(time,timezone),_,_,_,_)=get_changeset(ui,repo,revision,authors,encoding)
-
-  parents = [p for p in repo.changelog.parentrevs(revision) if p >= 0]
+def export_note(ui,repo,revision,count,mapping_cache,authors,encoding,is_first):
+  (changectx,_,user,(time,timezone),_,_,_,_)=get_changeset(ui,repo,revision,authors,encoding)
 
   wr('commit refs/notes/hg')
   wr('committer %s %d %s' % (user,time,timezone))
   wr('data 0')
   if is_first:
     wr('from refs/notes/hg^0')
-  wr('N inline :%d' % (revision+1))
-  hg_hash=repo.changectx(str(revision)).hex()
+  hg_hash=changectx.hex();
+  wr('N inline :%s' % mapping_cache[hg_hash])
   wr('data %d' % (len(hg_hash)))
   wr_no_nl(hg_hash)
   wr()
@@ -279,14 +277,12 @@ def export_tags(ui,repo,old_marks,mapping_cache,count,authors,tagsmap):
       sys.stderr.write('Tag %s refers to unseen node %s\n' % (tag, node.encode('hex_codec')))
       continue
 
-    rev=int(mapping_cache[node.encode('hex_codec')])
-
-    ref=revnum_to_revref(rev, old_marks)
+    ref=nodehex_to_revref(node.encode('hex_codec'), old_marks, mapping_cache)
     if ref==None:
       sys.stderr.write('Failed to find reference for creating tag'
           ' %s at r%d\n' % (tag,rev))
       continue
-    sys.stderr.write('Exporting tag [%s] at [hg r%d] [git %s]\n' % (tag,rev,ref))
+    sys.stderr.write('Exporting tag [%s] at [hg %s] [git %s]\n' % (tag,node.encode('hex_codec'),ref))
     wr('reset refs/tags/%s' % tag)
     wr('from %s' % ref)
     wr()
@@ -366,7 +362,7 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
 
   _max=int(m)
 
-  old_marks=load_cache(marksfile,lambda s: int(s)-1)
+  old_marks=load_cache(marksfile) #hg ordinal -> git
   mapping_cache=load_cache(mappingfile)
   heads_cache=load_cache(headsfile)
   state_cache=load_cache(tipfile)
@@ -375,7 +371,7 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
     for (name, data) in [(marksfile, old_marks),
                          (mappingfile, mapping_cache),
                          (headsfile, state_cache)]:
-      check_cache(name, data)
+        check_cache(name, data)
 
   ui,repo=setup_repo(repourl)
 
@@ -387,26 +383,30 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
   except AttributeError:
     tip=len(repo)
 
-  min=int(state_cache.get('tip',0))
+  last_mark=int(state_cache.get('last_mark',0))
   max=_max
   if _max<0 or max>tip:
     max=tip
 
-  for rev in range(0,max):
-  	(revnode,_,_,_,_,_,_,_)=get_changeset(ui,repo,rev,authors)
-  	mapping_cache[revnode.encode('hex_codec')] = str(rev)
+  revs = []
 
+  for rev in range(0,max):
+        (changectx,_,_,_,_,_,_,_)=get_changeset(ui,repo,rev,authors)
+        if not (changectx.hex() in mapping_cache):
+            revs.append(rev)
+            last_mark = last_mark + 1
+            mapping_cache[changectx.hex()] = str(last_mark)
 
   c=0
   brmap={}
-  for rev in range(min,max):
-    c=export_commit(ui,repo,rev,old_marks,max,c,authors,branchesmap,
+  for rev in revs:
+    c=export_commit(ui,repo,rev,old_marks,mapping_cache,max,c,authors,branchesmap,
                     sob,brmap,hgtags,encoding,fn_encoding)
   if notes:
-    for rev in range(min,max):
-      c=export_note(ui,repo,rev,c,authors, encoding, rev == min and min != 0)
+    for rev in revs:
+      c=export_note(ui,repo,rev,c,mapping_cache,authors, encoding, rev == min and min != 0)
 
-  state_cache['tip']=max
+  state_cache['last_mark']=last_mark
   state_cache['repo']=repourl
   save_cache(tipfile,state_cache)
   save_cache(mappingfile,mapping_cache)
